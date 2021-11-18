@@ -1,0 +1,366 @@
+from scipy.io import loadmat
+from scipy.stats import spearmanr
+import pandas as pd
+import os
+import scipy  # 先导入这个，tensorflow就不会报错了
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense, Flatten, Conv1D, MaxPooling1D
+
+path0 = os.getcwd()
+folderpath = '201903'
+filename = '000001.SZ.mat'
+
+
+def LoadData(folderpath, filename):
+    '''
+    :param filename: 读取的.mat文件路径
+    :return: 读取的.MAT文件数据和对应的col名称
+    '''
+    path = os.path.join(path0, 'Data', folderpath, filename)
+    m = loadmat(path)
+    col_names = [x for x in m['Data'].dtype.names]  # 在这里存储了14个列名称信息
+    Data = m['Data'][0][0]  # len(Data) = 14, 一共14列
+    return Data, col_names
+
+
+# 对在未来一分钟内的价格进行最大最小归一化的操作
+def norm_1m(price_s: pd.Series, windows=20) -> pd.Series:
+    '''
+    :param price_s: 为需要操作的均价序列
+    :param windows: 1分钟窗口，3s数据集windows=20
+    '''
+    norm_p = []
+    for i in range(len(price_s) - windows + 1):
+        price_window = price_s[i:i + windows]
+        norm_p.append((price_s[i] - min(price_window)) / (max(price_window) - min(price_window)) \
+                          if max(price_window) - min(price_window) != 0 else 1)  # 当分母为0时直接返回1
+    return pd.Series(norm_p)
+
+
+# 构建回归时，“相关性”的评价指标
+def get_spearman_rankcor(y_true, y_pred):
+    return (tf.py_function(spearmanr, [tf.cast(y_pred, tf.float32), tf.cast(y_true, tf.float32)], Tout=tf.float32))
+
+
+# ======================================================================================================================
+# 数据加载与预处理
+# ------------#
+Data, col_names = LoadData(folderpath, filename)
+
+data_date, data_time = Data['Date'], Data['Time']
+data_bidvol, data_bid = Data['bidvol'], Data['bid']  # 10档买量和10档买价
+data_askvol, data_ask = Data['askvol'], Data['ask']  # 10档卖量和10档卖价
+data_turnover = Data['turnover']  # 成交额
+data_index = Data['index']  # 大盘指数的过去5、10、20、40、60tick的收益率
+data_factor = Data['factor']  # 核心因子,对000001.SZ来说是有32个因子
+data_dtm = Data['d20_t10_m1']  # 前20天内跟标的股票相关性最高的股票指数，分别代表过去5，10，20，40，60tick的收益率
+data_dmm = Data['d60_m1_m1']  # 前60天内跟标的股票相关性最高的股票，分别代表过去5，10，20，40，60tick的收益率
+
+df_price = pd.DataFrame((data_bid + data_ask) / 2)  # 用十档买价和卖价的均值作为Price
+# r = df_price.pct_change(20).dropna(how='all', axis=0).values  # 【原】用下一分钟的收益率为标签，转为ndarray
+r = norm_1m(df_price[0]).dropna(how='all', axis=0).values  # 1m内的max-min归一化值，只用十档的数据，变成ndarray格式
+
+
+# ======================================================================================================================
+# test1
+# ------------#
+
+def split_sequence(sequence, sw_width, n_features):
+    '''
+    将序列数据分割为样本,输入卷积的格式为[samples,timesteps.features]
+    sw_width：表示观测数据的窗口
+    n_features：表示特征数量
+    '''
+    X, y = [], []
+    for i in range(len(sequence)):
+        end_element_index = i + sw_width
+        if end_element_index > len(sequence) - 1:
+            break
+
+        seq_x, seq_y = sequence[i:end_element_index], sequence[end_element_index]
+        X.append(seq_x)
+        y.append(seq_y)
+    process_X, process_y = np.array(X), np.array(y)
+    process_X = process_X.reshape((process_X.shape[0], process_X.shape[1], n_features))
+    return process_X, process_y
+
+
+# ========================================================================#
+# "单变量CNN模型" 仅用十档价格中的第一列
+# 简单的 1维CNN 模型部分
+# 第82次的mse为0.0799，呈收敛趋势，spearman相关性在 0.7450上下浮动
+# ========================================================================#
+def oned_cnn_model(sw_width, n_features, train_X, train_y, epoch_num, verbose_set):
+    '''
+    实验设置如下:
+    verbose_set = 2  # 每次都进行输出
+    epoch_num = 1000
+    sw_width = 200
+    n_features = 1
+    r0 = r # 仅用十档的数据进行1D实验
+    train_X, train_y = split_sequence(r0, sw_width, n_features)
+    model, history, yhat = oned_cnn_model(sw_width, n_features, train_X, train_y, epoch_num, verbose_set)
+    '''
+    model = Sequential()
+    model.add(Conv1D(filters=2, kernel_size=2, activation='relu',
+                     strides=1, padding='valid', data_format='channels_last',
+                     input_shape=(sw_width, n_features)))
+
+    model.add(MaxPooling1D(pool_size=2, strides=None, padding='valid',
+                           data_format='channels_last'))
+    model.add(Flatten())  # 将所有的数据压平成序列
+
+    # Dense执行以下操作：output=activation(dot(input,kernel)+bias)
+    # 其中，activation是激活函数，kernel是由层创建的权重矩阵，bias是由层创建的偏移向量（仅当use_bias为True时适用）
+    model.add(Dense(units=50, activation='relu',
+                    use_bias=True, kernel_initializer='glorot_uniform', bias_initializer='zero'))
+
+    # 预测下一个时间步的值，将输出的units设置为1
+    model.add(Dense(units=1))
+
+    # 配置模型，metrics可能需要修改一下
+    model.compile(optimizer='adam', loss='mse',
+                  metrics=get_spearman_rankcor)
+
+    print('\n', model.summary())
+    # verbose=0/1/2, 0=训练过程无输出，1=显示训练过程进度条，2=没训练一个epoch打印一次
+    history = model.fit(train_X, train_y, batch_size=32, epochs=epoch_num, verbose=verbose_set)
+    # 指利用3s的收益率特征进行时间序列的预测
+
+    return model, history
+
+
+# ======================================================================================================================
+# test2
+# ------------#
+def split_multi_sequences(X_dataset, y_dataset, sw_width):
+    '''
+    针对多个输入变量的时间序列，对多变量时间序列数据和标签进行切分
+    '''
+    X, y = [], []
+    for i in range(len(y_dataset)):  # len是从1开始的
+        end_element_index = i + sw_width  # 索引切片从0开始，区间为前闭后开
+        if end_element_index > len(y_dataset) - 1:
+            break
+
+        # 实现步长为1的滑动窗口截取数据功能
+        seq_X, seq_y = X_dataset[i:end_element_index, :], y_dataset[end_element_index - 1]
+        X.append(seq_X)
+        y.append(seq_y)
+    process_X, process_y = np.array(X), np.array(y)
+    n_features = process_X.shape[2]
+    return process_X, process_y, n_features
+
+
+# ========================================================================#
+# "多变量CNN模型"
+# 选取32个factor作为特征列
+# 前500次的loss收敛到0.0810 ，spearman相关性spearman相关性收敛到0.7600
+# ========================================================================#
+def oned_cnn_multi_model(sw_width, n_features, train_X, train_y, epoch_num, verbose_set, yd=1):
+    '''
+    实验设置如下：
+    X_dataset = data_factor[:-19]  # 需要错位
+    y_dataset = r
+    sw_width = 200
+    process_X, process_y, n_features = split_multi_sequences(X_dataset, y_dataset, sw_width) # n_features = 32
+    epoch_num = 1000
+    verbose_set = 2
+    model, history = oned_cnn_multi_model(sw_width, n_features, process_X, process_y, epoch_num, verbose_set)
+    '''
+    model = Sequential()
+
+    model.add(Conv1D(filters=128, kernel_size=2, activation='relu',
+                     strides=1, padding='valid', data_format='channels_last',
+                     input_shape=(sw_width, n_features)))
+
+    model.add(MaxPooling1D(pool_size=2, strides=None, padding='valid', data_format='channels_last'))
+
+    model.add(Flatten())
+
+    model.add(Dense(units=50, activation='relu',
+                    use_bias=True, kernel_initializer='glorot_uniform', bias_initializer='zeros', ))
+
+    model.add(Dense(units=yd))  # 根据标签的特征量进行输入，默认为1
+
+    model.compile(optimizer='adam', loss='mse', metrics=get_spearman_rankcor)
+
+    print('\n', model.summary())
+
+    history = model.fit(train_X, train_y, batch_size=32, epochs=epoch_num, verbose=verbose_set)
+
+    return model, history
+
+
+# ======================================================================================================================
+# test3
+# ------------#
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, concatenate
+from tensorflow.keras.utils import plot_model
+
+
+def split_sequence2(X_dataset, y_dataset, sw_width, n_features):
+    '''
+    仅拆分为2个子模型进行训练
+    '''
+    X, y = [], []
+    for i in range(len(y_dataset)):
+        end_element_index = i + sw_width
+        if end_element_index > len(y_dataset):
+            break
+        # 实现步长为1的滑动窗口截取数据功能
+        seq_X, seq_y = X_dataset[i:end_element_index], y_dataset[end_element_index - 1]
+        X.append(seq_X)
+        y.append(seq_y)
+    process_X, process_y = np.array(X), np.array(y)
+
+    # [:,:,0]表示三维数组前两个维度的数据全取，第三个维度取第一个数据，一摞饼干取了一块。
+    # n_features应该是特征数量的1/2
+    X1 = process_X[:, :, 0:n_features].reshape(process_X.shape[0], process_X.shape[1], n_features)
+    X2 = process_X[:, :, n_features:].reshape(process_X.shape[0], process_X.shape[1], n_features)
+
+    return X1, X2, process_y
+
+
+# ========================================================================#
+# "2模型多变量CNN模型" 标签选用用十档价格中的第一列
+# 选取所有factor作为特征列,前后16 factors各拆成单独的一组
+# 前50次的loss没有收敛, 或低或高于1.9562e-07，accuracy为0.8267
+# ========================================================================#
+def oned_multi_head_cnn_model(n_steps, n_features, train_X1, train_X2, train_y, epoch_num, verbose_set):
+    '''
+    实验设置如下：
+    X_dataset = data_factor[:-19]  # 需要错位，r表示的是到下一个1m的收益率
+    y_dataset = r[:, 0]
+    n_steps, sw_width = 200, 200
+    n_features = int(X_dataset.shape[1] / 2)
+    train_X1, train_X2, train_y = split_sequence2(X_dataset, y_dataset, sw_width, n_features)
+    epoch_num = 1000
+    verbose_set = 2
+    model, history = oned_multi_head_cnn_model(n_steps, n_features, train_X1, train_X2, train_y, epoch_num, verbose_set)
+    '''
+    visible1 = Input(shape=(n_steps, n_features))
+    cnn1 = Conv1D(filters=64, kernel_size=2, activation='relu')(visible1)
+    cnn1 = MaxPooling1D(pool_size=2)(cnn1)
+    cnn1 = Flatten()(cnn1)
+
+    visible2 = Input(shape=(n_steps, n_features))
+    cnn2 = Conv1D(filters=64, kernel_size=2, activation='relu')(visible2)
+    cnn2 = MaxPooling1D(pool_size=2)(cnn2)
+    cnn2 = Flatten()(cnn2)
+
+    merge = concatenate([cnn1, cnn2])
+    dense = Dense(50, activation='relu')(merge)
+    output = Dense(1)(dense)
+
+    model = Model(inputs=[visible1, visible2], outputs=output)
+
+    model.compile(optimizer='adam', loss='mse', metrics=get_spearman_rankcor)
+
+    print('\n', model.summary())
+    plot_model(model, to_file='multi_head_cnn_model.png', show_layer_names=True, show_shapes=True, rankdir='TB',
+               dpi=200)
+
+    history = model.fit([train_X1, train_X2], train_y, batch_size=32, epochs=epoch_num, verbose=verbose_set)
+
+    return model, history
+
+
+# ======================================================================================================================
+# test4
+# ------------#
+# ========================================================================#
+# "多变量-向量CNN模型" 用十档价格中的所有档价格形成标签向量
+# 选取所有factor作为特征列
+# 实验效果不佳（？），测试集的准确率低。 loss: 1.8254e-07 - accuracy: 0.3728
+# ========================================================================#
+'''
+    实验设置如下：
+    X_dataset = data_factor[:-19]  # 需要错位，r表示的是到下一个1m的收益率
+    y_dataset = r
+    sw_width = 200
+    process_X, process_y, n_features = split_multi_sequences(X_dataset, y_dataset, sw_width)
+    epoch_num = 1000
+    verbose_set = 2
+    model, history = oned_cnn_multi_model(sw_width, n_features, process_X, process_y, epoch_num, verbose_set,
+                                          yd=int(process_y.shape[1]))
+'''
+
+
+# ======================================================================================================================
+# test5
+# ------------#
+def split_multi_output_sequences(X_dataset, y_dataset, sw_width):
+    '''
+    完成拆分标签y的工作
+    multi_output_lst：dict
+    '''
+    process_X, process_y, n_features = split_multi_sequences(X_dataset, y_dataset, sw_width)
+    # 再把输出的y拆分开来
+    multi_output_lst = {}  # 用字典格式存储分拆出来的标签y
+    for i in range(y_dataset.shape[1]):
+        multi_output_lst['y{}'.format(str(i))] = process_y[:, i].reshape((process_y.shape[0], 1))
+
+    return process_X, process_y, n_features, multi_output_lst
+
+
+# ========================================================================#
+# "多变量多输出CNN模型" 标签单独用一个神经网络进行训练
+# 选取所有factor作为特征列
+# 每个dense的loss均值在 1.7987e-07附近，accuracy为0.8244
+# ========================================================================#
+def oned_multi_ouput_cnn_model(n_steps, n_features, train_X, train_y, epoch_num, verbose_set):
+    '''
+    实验设置如下：
+    X_dataset = data_factor[:-19]  # 需要错位，r表示的是到下一个1min的收益率
+    y_dataset = r
+    sw_width = 200
+    epoch_num = 1000
+    verbose_set = 2
+    process_X, process_y, n_features, multi_output_lst = split_multi_output_sequences(X_dataset, y_dataset, sw_width)
+    model,history = oned_multi_ouput_cnn_model(sw_width,n_features,process_X,[y for y in multi_output_lst.values()],
+                                               epoch_num,verbose_set)
+    '''
+    visible = Input(shape=(n_steps, n_features))
+    cnn = Conv1D(filters=64, kernel_size=2, activation='relu')(visible)
+    cnn = MaxPooling1D(pool_size=2)(cnn)
+    cnn = Flatten()(cnn)
+    cnn = Dense(50, activation='relu')(cnn)
+
+    # 创立单独的输出通道
+    output0 = Dense(1)(cnn)
+    output1 = Dense(1)(cnn)
+    output2 = Dense(1)(cnn)
+    output3 = Dense(1)(cnn)
+    output4 = Dense(1)(cnn)
+    output5 = Dense(1)(cnn)
+    output6 = Dense(1)(cnn)
+    output7 = Dense(1)(cnn)
+    output8 = Dense(1)(cnn)
+    output9 = Dense(1)(cnn)
+
+    model = Model(inputs=visible, outputs=[output0, output1, output2, output3, output4, output5, \
+                                           output6, output7, output8, output9])
+    model.compile(optimizer='adam', loss='mse',
+                  metrics=get_spearman_rankcor)
+
+    print('\n', model.summary())
+    plot_model(model, to_file='multi_output_cnn_model.png', show_layer_names=True, show_shapes=True, rankdir='TB',
+               dpi=200)
+
+    history = model.fit(train_X, train_y, batch_size=32, epochs=epoch_num, verbose=verbose_set)
+
+    return model, history
+
+
+if __name__ == '__main__':
+    X_dataset = data_factor[:-19]  # 需要错位
+    y_dataset = r
+    sw_width = 200
+    process_X, process_y, n_features = split_multi_sequences(X_dataset, y_dataset, sw_width) # n_features = 32
+    epoch_num = 1000
+    verbose_set = 2
+    # model, history = oned_cnn_multi_model(sw_width, n_features, process_X, process_y, epoch_num, verbose_set)
